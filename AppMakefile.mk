@@ -274,7 +274,22 @@ $(foreach platform, $(TOCK_TARGETS), $(eval $(call BUILD_RULES,$(call ARCH_FN,$(
 $(BUILDDIR)/$(PACKAGE_NAME).tab: $(foreach platform, $(TOCK_TARGETS), $(BUILDDIR)/$(call ARCH_FN,$(platform))/$(call OUTPUT_NAME_FN,$(platform)).elf)
 	$(Q)$(ELF2TAB) $(ELF2TAB_ARGS) -o $@ $^
 
+#
+# These don't really belong here, but I wanted to provide an easy way to try
+# running the examples on cheri QEMU.
 
+THIS_FILE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+TOCK_DIR ?= $(THIS_FILE)../tock
+
+# Run a hybrid app
+.PHONY: run_hybrid
+run_hybrid : $(BUILDDIR)/$(PACKAGE_NAME).tab
+	APP_BIN=$(abspath $(BUILDDIR)/rv64imacxcheri/rv64imacxcheri.tbf) make -C $(TOCK_DIR)/boards/qemu_cheri_virt run_app
+
+# Run a purecap app
+.PHONY: run_pure
+run_pure : $(BUILDDIR)/$(PACKAGE_NAME).tab
+	APP_BIN=$(abspath $(BUILDDIR)/rv64imacxcheripure/rv64imacxcheripure.tbf) make -C $(TOCK_DIR)/boards/qemu_cheri_virt run_app
 
 # Rules for building apps
 .PHONY:	all

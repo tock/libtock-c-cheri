@@ -4,11 +4,43 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// CHERI casting seems a little broken on hybrid, so this is a workaround.
+
+// ccast casts from an expression that has type "x* __capability" to a pointer type T
+// acast casts from an expeession that has type "x* __capability" to size_t
+#if __has_feature(capabilities)
+  #include <cheriintrin.h>
+  #ifdef __CHERI_PURE_CAPABILITY__
+    #define ccast(T, expr) ((T)expr)
+    #define acast(expr) ((size_t)(__builtin_cheri_address_get(expr)))
+  #else
+    #define ccast(T, expr) ((T)(__builtin_cheri_address_get(expr)))
+    #define acast(expr) ((size_t)(__builtin_cheri_address_get(expr)))
+  #endif
+#else
+    #define __capability
+    #define ccast(T, expr) ((T)expr)
+    #define acast(expr) ((size_t)expr)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef void (subscribe_upcall)(int, int, int, void*);
+
+// TODO: refactor for this prototype. b/288076215
+// The Tock kernel uses usize for r0/r1/r2, so size_t is appropriate
+// On CHERI, the kernel is using cptr for appdata, but might need updating
+// to use cptr for all arguments as some (for example ipc) pass pointers
+// in other arguments.
+typedef void (subscribe_upcall_full)(size_t, size_t, size_t, void*);
+
+// A common callback that simply sets a flag that the event has occured.
+static inline void subscribe_upcall_set_flag(__unused int r0, __unused int r1,
+                                      __unused int r3, void* flag) {
+  *(bool*)flag = true;
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 ///
@@ -76,9 +108,10 @@ typedef enum {
 } statuscode_t;
 
 // Generic return structure from a system call.
+// Commands are not allowed to return capabilities, so the type here is size_t
 typedef struct {
   syscall_rtype_t type;
-  uint32_t data[3];
+  size_t data[3];
 } syscall_return_t;
 
 // Return structure from a subscribe syscall. The `subscribe()` implementation
@@ -124,7 +157,7 @@ typedef struct {
   statuscode_t status;
   // Optional return data depending on the memop variant called. Only set if
   // status is `TOCK_STATUSCODE_SUCCESS`.
-  uint32_t data;
+  void* __capability data;
 } memop_return_t;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -161,7 +194,7 @@ int tock_allow_rw_return_to_returncode(allow_rw_return_t);
 // Convert a `allow_ro_return_t` to a `returncode_t`.
 int tock_allow_ro_return_to_returncode(allow_ro_return_t);
 
-int tock_enqueue(subscribe_upcall cb, int arg0, int arg1, int arg2, void* ud);
+int tock_enqueue(subscribe_upcall cb, size_t arg0, size_t arg1, size_t arg2, void* ud);
 
 int yield_check_tasks(void);
 void yield(void);
@@ -172,7 +205,11 @@ void tock_exit(uint32_t completion_code) __attribute__ ((noreturn));
 void tock_restart(uint32_t completion_code) __attribute__ ((noreturn));
 
 __attribute__ ((warn_unused_result))
-syscall_return_t command(uint32_t driver, uint32_t command, int arg1, int arg2);
+syscall_return_t command(uint32_t driver, uint32_t command, size_t arg1, size_t arg2);
+
+__attribute__ ((warn_unused_result))
+syscall_return_t command3(uint32_t driver, uint32_t command,
+                          size_t arg1, size_t arg2, size_t arg3);
 
 // Pass this to the subscribe syscall as a function pointer to
 // be the Null Upcall.
@@ -193,7 +230,7 @@ __attribute__ ((warn_unused_result))
 allow_ro_return_t allow_readonly(uint32_t driver, uint32_t allow, const void* ptr, size_t size);
 
 // Call the memop syscall.
-memop_return_t memop(uint32_t op_type, int arg1);
+memop_return_t memop(uint32_t op_type, size_t arg1);
 
 // Wrappers around memop to support app introspection
 void* tock_app_memory_begins_at(void);

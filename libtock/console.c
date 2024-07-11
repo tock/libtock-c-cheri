@@ -5,7 +5,7 @@
 #include "console.h"
 
 typedef struct putstr_data {
-  char* buf;
+  const char* buf;
   int len;
   bool called;
   struct putstr_data* next;
@@ -37,17 +37,21 @@ static void putstr_upcall(int _x __attribute__ ((unused)),
 int putnstr(const char *str, size_t len) {
   int ret = RETURNCODE_SUCCESS;
 
-  putstr_data_t* data = (putstr_data_t*)malloc(sizeof(putstr_data_t));
-  if (data == NULL) return RETURNCODE_ENOMEM;
+  putstr_data_t local;
+
+  putstr_data_t* data = (putstr_data_t*)&local;
 
   data->len    = len;
   data->called = false;
-  data->buf    = (char*)malloc(len * sizeof(char));
+  // Note: if the user modifies their string in an upcall, they deserve garbage
+  // on their console.
+  data->buf = str;
+
   if (data->buf == NULL) {
     ret = RETURNCODE_ENOMEM;
     goto putnstr_fail_buf_alloc;
   }
-  strncpy(data->buf, str, len);
+
   data->next = NULL;
 
   if (putstr_tail == NULL) {
@@ -64,9 +68,7 @@ int putnstr(const char *str, size_t len) {
   yield_for(&data->called);
 
 putnstr_fail_async:
-  free(data->buf);
 putnstr_fail_buf_alloc:
-  free(data);
 
   return ret;
 }

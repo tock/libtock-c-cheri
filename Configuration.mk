@@ -11,6 +11,7 @@ MAKEFLAGS += -r
 MAKEFLAGS += -R
 
 # Toolchain programs
+ifeq ($(CHERI),)
 AR := -ar
 AS := -as
 CXX := -g++
@@ -18,6 +19,20 @@ OBJDUMP := -objdump
 RANLIB := -ranlib
 READELF := -readelf
 SIZE := -size
+else
+# AppMakefile.mk tries to append these to the "TOOLCHAIN_x" parameter.
+# Sadly, the compiler for the CHERI toolchain is not llvm-clang, it is just clang,
+# so we need the names without a hyphen unlike above.
+AR := ar
+AS := as
+CXX := clang++
+OBJDUMP := objdump
+RANLIB := ranlib
+READELF := readelf
+SIZE := size
+STRIP := strip
+OBJCOPY := objcopy
+endif
 
 # Set default region sizes
 STACK_SIZE       ?= 2048
@@ -65,6 +80,12 @@ OPENTITAN_TOCK_TARGETS := rv32imc|rv32imc.0x20030080.0x10005000|0x20030080|0x100
 ARTY_E21_TOCK_TARGETS := rv32imac|rv32imac.0x40430060.0x80004000|0x40430060|0x80004000\
                          rv32imac|rv32imac.0x40440060.0x80007000|0x40440060|0x80007000
 
+CHERI_TARGETS := 	rv64imacxcheri\
+           			rv64imacxcheripure
+
+ifneq ($(CHERI),)
+TOCK_TARGETS ?= $(CHERI_TARGETS)
+else
 # Include the RISC-V targets.
 #  rv32imac|rv32imac.0x20040060.0x80002800 # RISC-V for HiFive1b
 #  rv32imac|rv32imac.0x403B0060.0x3FCC0000 # RISC-V for ESP32-C3
@@ -81,26 +102,28 @@ TOCK_TARGETS ?= cortex-m0\
                 $(OPENTITAN_TOCK_TARGETS) \
                 $(ARTY_E21_TOCK_TARGETS)
 endif
+endif
 
 # Generate TOCK_ARCHS, the set of architectures listed in TOCK_TARGETS
 TOCK_ARCHS := $(sort $(foreach target, $(TOCK_TARGETS), $(firstword $(subst |, ,$(target)))))
 
 # Check if elf2tab exists, if not, install it using cargo.
 ELF2TAB ?= elf2tab
-ELF2TAB_REQUIRED_VERSION := 0.7.0
+ELF2TAB_REQUIRED_VERSION := 0.10.2
 ELF2TAB_EXISTS := $(shell $(SHELL) -c "command -v $(ELF2TAB)")
 ELF2TAB_VERSION := $(shell $(SHELL) -c "$(ELF2TAB) --version | cut -d ' ' -f 2")
 
 # Check elf2tab version
 UPGRADE_ELF2TAB := $(shell $(SHELL) -c "printf '%s\n%s\n' '$(ELF2TAB_REQUIRED_VERSION)' '$(ELF2TAB_VERSION)' | sort --check=quiet --version-sort || echo yes")
 
-ifeq ($(UPGRADE_ELF2TAB),yes)
-  $(info Trying to update elf2tab to >= $(ELF2TAB_REQUIRED_VERSION))
+# Ensure that we install exactly the required version
+ifneq ($(ELF2TAB_REQUIRED_VERSION),$(ELF2TAB_VERSION))
+  $(info Trying to update elf2tab to $(ELF2TAB_REQUIRED_VERSION))
   ELF2TAB_EXISTS =
 endif
 
 ifndef ELF2TAB_EXISTS
-  $(shell cargo install elf2tab)
+  $(shell cargo install -f --version $(ELF2TAB_REQUIRED_VERSION) elf2tab)
   # Check elf2tab version after install
   ELF2TAB_VERSION := $(shell $(SHELL) -c "$(ELF2TAB) --version | cut -d ' ' -f 2")
   UPGRADE_ELF2TAB := $(shell $(SHELL) -c "printf '%s\n%s\n' '$(ELF2TAB_REQUIRED_VERSION)' '$(ELF2TAB_VERSION)' | sort --check=quiet --version-sort || echo yes")
@@ -111,6 +134,8 @@ endif
 
 ELF2TAB_ARGS += -n $(PACKAGE_NAME)
 ELF2TAB_ARGS += --stack $(STACK_SIZE) --app-heap $(APP_HEAP_SIZE) --kernel-heap $(KERNEL_HEAP_SIZE) --kernel-major $(KERNEL_MAJOR_VERSION) --kernel-minor $(KERNEL_MINOR_VERSION)
+# This helps keep the program nice and aligned. Otherwise the header ends up 76 bytes.
+ELF2TAB_ARGS += --protected-region-size 96
 
 # Setup the correct toolchain for each architecture.
 TOOLCHAIN_cortex-m0 := arm-none-eabi
@@ -118,27 +143,41 @@ TOOLCHAIN_cortex-m3 := arm-none-eabi
 TOOLCHAIN_cortex-m4 := arm-none-eabi
 TOOLCHAIN_cortex-m7 := arm-none-eabi
 
+THIS_FILE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+CHERI_SDK ?= $(abspath ${THIS_FILE}/../cheri/output/sdk)
+
 # RISC-V toolchains, irrespective of their name-tuple, can compile for
 # essentially any target. Thus, try a few known names and choose the one for
 # which a compiler is found.
-ifneq (,$(shell which riscv64-none-elf-gcc 2>/dev/null))
-  TOOLCHAIN_rv32i := riscv64-none-elf
+
+ifneq (,$(shell which $(CHERI_SDK)/bin/clang))
+  TOOLCHAIN_x := $(CHERI_SDK)/bin/
+else ifneq (,$(shell which ~/cheri/output/sdk/bin/clang))
+  TOOLCHAIN_x := ~/cheri/output/sdk/bin/
+else ifneq (,$(shell which riscv64-none-elf-gcc 2>/dev/null))
+  TOOLCHAIN_x := riscv64-none-elf
 else ifneq (,$(shell which riscv32-none-elf-gcc 2>/dev/null))
-  TOOLCHAIN_rv32i := riscv32-none-elf
+  TOOLCHAIN_x := riscv32-none-elf
 else ifneq (,$(shell which riscv64-elf-gcc 2>/dev/null))
-  TOOLCHAIN_rv32i := riscv64-elf
+  TOOLCHAIN_x := riscv64-elf
 else ifneq (,$(shell which riscv64-unknown-elf-clang 2>/dev/null))
-  TOOLCHAIN_rv32i := riscv64-unknown-elf
+  TOOLCHAIN_x := riscv64-unknown-elf
 else ifneq (,$(shell which riscv32-unknown-elf-clang 2>/dev/null))
-  TOOLCHAIN_rv32i := riscv32-unknown-elf
+  TOOLCHAIN_x := riscv32-unknown-elf
 else
   # Fallback option. We don't particularly want to throw an error (even if
   # RISCV=1 is set) as this configuration makefile can be useful without a
   # proper toolchain.
-  TOOLCHAIN_rv32i := riscv64-unknown-elf
+  TOOLCHAIN_x := riscv64-unknown-elf
 endif
-TOOLCHAIN_rv32imac := $(TOOLCHAIN_rv32i)
-TOOLCHAIN_rv32imc := $(TOOLCHAIN_rv32i)
+
+TOOLCHAIN_rv32i := $(TOOLCHAIN_x)
+TOOLCHAIN_rv32imac := $(TOOLCHAIN_x)
+TOOLCHAIN_rv32imc := $(TOOLCHAIN_x)
+TOOLCHAIN_rv32imacxcheri := $(TOOLCHAIN_x)
+TOOLCHAIN_rv64imac := $(TOOLCHAIN_x)
+TOOLCHAIN_rv64imacxcheri := $(TOOLCHAIN_x)
+TOOLCHAIN_rv64imacxcheripure := $(TOOLCHAIN_x)
 
 # Setup the correct compiler. For cortex-m we only support GCC as it is the only
 # toolchain with the PIC support we need for Tock userspace apps.
@@ -153,14 +192,24 @@ CC_cortex-m7 := $(CC_cortex-m)
 # default to that.
 ifeq ($(CLANG),)
   # Default to GCC
-  CC_rv32     := -gcc
+  CC_X     := -gcc
 else
   # If `CLANG=1` on command line, use -clang
-  CC_rv32     := -clang
+  # With the toolchain built for the CHERI, the names are different
+  ifeq ($(CHERI),)
+    CC_X     := -clang
+  else
+    CC_X     := clang
+  endif
 endif
-CC_rv32i    := $(CC_rv32)
-CC_rv32imc  := $(CC_rv32)
-CC_rv32imac := $(CC_rv32)
+CC_rv32		:= $(CC_X)
+CC_rv32i    := $(CC_X)
+CC_rv32imc  := $(CC_X)
+CC_rv32imac := $(CC_X)
+CC_rv32imacxcheri :=$(CC_X)
+CC_rv64imac := $(CC_X)
+CC_rv64imacxcheri := $(CC_X)
+CC_rv64imacxcheripure := $(CC_X)
 
 # Flags for building app Assembly, C, C++ files
 # n.b. make convention is that CPPFLAGS are shared for C and C++ sources
@@ -173,12 +222,16 @@ override CPPFLAGS += \
       -Os\
       -fdata-sections -ffunction-sections\
       -fstack-usage\
+      -fno-rtti\
+      -fno-exceptions\
       -Wall\
       -Wextra
+
 override WLFLAGS += \
       -Wl,--warn-common\
       -Wl,--gc-sections\
       -Wl,--build-id=none
+
 
 # Various flags for a specific toolchain. Different compilers may have different
 # supported features. For GCC we warn if the compiler estimates the stack usage
@@ -208,6 +261,7 @@ endif
 # fully relocatable. Therefore, just including these flags is not sufficient to
 # build a full PIC app for Tock. So, we split these out, and only include them
 # for architectures where we have full PIC support.
+
 override CPPFLAGS_PIC += \
       -Wl,--emit-relocs\
       -fPIC
@@ -220,7 +274,9 @@ override CFLAGS_rv32imc  += $(CFLAGS_rv32)
 override CFLAGS_rv32imac += $(CFLAGS_rv32)
 
 override CPPFLAGS_rv32 += \
-      $(CPPFLAGS_toolchain_rv32)
+      $(CPPFLAGS_toolchain_rv32)\
+      -fPIE\
+      --target=riscv32-none-elf\
 
 # Add different flags for different architectures
 override CPPFLAGS_rv32i += $(CPPFLAGS_rv32) \
@@ -228,31 +284,84 @@ override CPPFLAGS_rv32i += $(CPPFLAGS_rv32) \
       -mabi=ilp32\
       -mcmodel=medlow
 
-override WLFLAGS_rv32i += \
-      -Wl,--no-relax   # Prevent use of global_pointer for riscv
+WLFLAGS_x = -Wl,--no-relax   # Prevent use of global_pointer for riscv
+
+ifneq ($(CHERI),)
+  WLFLAGS_x += -Wl,-z,norelro,--no-rosegment,-pie,-zrel,-znow,-znotext,--no-dynamic-linker
+endif
+
+override WLFLAGS_rv32i += $(WLFLAGS_x)
 
 override CPPFLAGS_rv32imc += $(CPPFLAGS_rv32) \
       -march=rv32imc\
       -mabi=ilp32\
       -mcmodel=medlow
 
-override WLFLAGS_rv32imc += \
-      -Wl,--no-relax   # Prevent use of global_pointer for riscv
+override WLFLAGS_rv32imc += $(WLFLAGS_x)
 
 override CPPFLAGS_rv32imac += $(CPPFLAGS_rv32) \
       -march=rv32imac\
       -mabi=ilp32\
       -mcmodel=medlow
 
-override WLFLAGS_rv32imac += \
-      -Wl,--no-relax   # Prevent use of global_pointer for riscv
+
+override WLFLAGS_rv32imac += $(WLFLAGS_x)
+
+override CPPFLAGS_rv32imacxcheri += $(CPPFLAGS_rv32) \
+      -march=rv32imacxcheri\
+      -mabi=ilp32\
+      -mcmodel=medlow
+
+override WLFLAGS_rv32imacxcheri += $(WLFLAGS_x)
+
+override CPPFLAGS_rv64imac += $(CPPFLAGS_rv32) \
+      --target=riscv64-none-elf\
+      -march=rv64imac\
+      -mabi=lp64\
+      -mcmodel=medany
+
+override WLFLAGS_rv64imac += $(WLFLAGS_x)
+
+override CPPFLAGS_rv64imacxcheri += $(CPPFLAGS_rv32) \
+      --target=riscv64-none-elf\
+      -march=rv64imacxcheri\
+      -mabi=lp64\
+      -mcmodel=medany
+
+override WLFLAGS_rv64imacxcheri += $(WLFLAGS_x)
+
+override CPPFLAGS_rv64imacxcheripure += $(CPPFLAGS_rv32) \
+      --target=riscv64-none-elf\
+      -march=rv64imacxcheri\
+      -mabi=l64pc128\
+      -mcmodel=medany
+
+override WLFLAGS_rv64imacxcheripure += $(WLFLAGS_x)
+
+ifneq ($(CHERI),)
+# On CHERI, I want to provide my own libc
+# By default, we should look within the CHERI_SDK
+LIBC_ROOT ?= ${CHERI_SDK}/baremetal
+
+override LINK_LIBS_cheri += -lc -lm -lgcc
+
+override LINK_LIBS_rv32 += $(LINK_LIBS_cheri)
+
+override CPPFLAGS_rv32imac += --sysroot=${LIBC_ROOT}/baremetal-newlib-riscv32/riscv32-unknown-elf
+
+override CPPFLAGS_rv32imacxcheri += --sysroot=${LIBC_ROOT}/baremetal-newlib-riscv32-hybrid/riscv32-unknown-elf
+
+override CPPFLAGS_rv64imac += --sysroot=${LIBC_ROOT}/baremetal-newlib-riscv64/riscv64-unknown-elf
+
+override CPPFLAGS_rv64imacxcheri += --sysroot=${LIBC_ROOT}/baremetal-newlib-riscv64-hybrid/riscv64-unknown-elf
+
+override CPPFLAGS_rv64imacxcheripure += --sysroot=${LIBC_ROOT}/baremetal-newlib-riscv64-purecap/riscv64-unknown-elf
+
+else
+# Otherwise use the provided one
 
 override LINK_LIBS_rv32 += \
       -lgcc -lstdc++ -lsupc++
-
-override LINK_LIBS_rv32i    += $(LINK_LIBS_rv32)
-override LINK_LIBS_rv32imc  += $(LINK_LIBS_rv32)
-override LINK_LIBS_rv32imac += $(LINK_LIBS_rv32)
 
 override LEGACY_LIBS_rv32i += \
       $(TOCK_USERLAND_BASE_DIR)/newlib/rv32/rv32i/libc.a\
@@ -267,6 +376,15 @@ override LEGACY_LIBS_rv32imc += $(LEGACY_LIBS_rv32im)
 override LEGACY_LIBS_rv32imac += \
       $(TOCK_USERLAND_BASE_DIR)/newlib/rv32/rv32imac/libc.a\
       $(TOCK_USERLAND_BASE_DIR)/newlib/rv32/rv32imac/libm.a
+endif
+
+override LINK_LIBS_rv32i    += $(LINK_LIBS_rv32)
+override LINK_LIBS_rv32imc  += $(LINK_LIBS_rv32)
+override LINK_LIBS_rv32imac += $(LINK_LIBS_rv32)
+override LINK_LIBS_rv64imac += $(LINK_LIBS_rv32)
+override LINK_LIBS_rv32imacxcheri += $(LINK_LIBS_rv32)
+override LINK_LIBS_rv64imacxcheri += $(LINK_LIBS_rv32)
+override LINK_LIBS_rv64imacxcheripure += $(LINK_LIBS_rv32)
 
 override CFLAGS_cortex-m += \
       $(CFLAGS_toolchain_cortex-m)

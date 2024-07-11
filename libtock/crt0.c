@@ -12,6 +12,15 @@
 #error Fixed STACK_SIZE.
 #endif
 
+#ifdef __CHERI_PURE_CAPABILITY__
+// Setting this will ensure caprelocs take into account the fact that the process has been relocated
+#define CHERI_INIT_GLOBALS_USE_OFFSET
+#include "cheri_init_globals.h"
+#endif
+
+// The program has been loaded contiguously and does not need data relocating
+#define CONTIGUOUS 1
+
 extern int main(void);
 
 // Allow _start to go undeclared
@@ -22,33 +31,20 @@ extern int main(void);
 // text segment. It represents sizes and offsets from the text segment of
 // sections that need some sort of loading and/or relocation.
 struct hdr {
-  //  0: Offset of GOT symbols in flash from the start of the application
-  //     binary.
-  uint32_t got_sym_start;
-  //  4: Offset of where the GOT section needs to be placed in memory from the
-  //     start of the application's memory region.
-  uint32_t got_start;
-  //  8: Size of GOT section.
-  uint32_t got_size;
-  // 12: Offset of data symbols in flash from the start of the application
-  //     binary.
-  uint32_t data_sym_start;
-  // 16: Offset of where the data section needs to be placed in memory from the
-  //     start of the application's memory region.
-  uint32_t data_start;
-  // 20: Size of data section.
-  uint32_t data_size;
-  // 24: Offset of where the BSS section needs to be placed in memory from the
-  //     start of the application's memory region.
-  uint32_t bss_start;
-  // 28: Size of BSS section.
-  uint32_t bss_size;
-  // 32: First address offset after program flash, where elf2tab places
-  //     .rel.data section
-  uint32_t reldata_start;
-  // 36: The size of the stack requested by this application.
+  uint32_t stack_location;
   uint32_t stack_size;
+  uint32_t bss_start;
+  uint32_t bss_size;
+  uint32_t rel_start;
+  uint32_t rel_size;
 };
+
+#define OFF_STACK_LOC "0x00"
+#define OFF_STACK_SZ  "0x04"
+#define OFF_BSS_START "0x08"
+#define OFF_BSS_SIZE  "0x0C"
+#define OFF_REL_START "0x10"
+#define OFF_REL_SIZE  "0x14"
 
 // The structure of the relative data section. This structure comes from the
 // compiler.
@@ -79,15 +75,19 @@ void _start(void* app_start __attribute__((unused)),
   // http://infocenter.arm.com/help/topic/com.arm.doc.ihi0042f/IHI0042F_aapcs.pdf
 
   __asm__ volatile (
-    // Compute the stack top
+    // entry:
+    //    r0 = hdr
+    //    r1 = mem_start
+    //    r2 =
+    //    r3 = initial_brk
+    // Compute the stack top.
     //
-    // struct hdr* myhdr = (struct hdr*)app_start;
-    // uint32_t stacktop = (((uint32_t)mem_start + myhdr->stack_size + 7) & 0xfffffff8);
-    "ldr  r4, [r0, #36]\n"      // r4 = myhdr->stack_size
-    "add  r4, #7\n"             // r4 = myhdr->stack_size + 7
-    "add  r4, r4, r1\n"         // r4 = mem_start + myhdr->stack_size + 7
-    "movs r5, #7\n"
-    "bic  r4, r4, r5\n"         // r4 = (mem_start + myhdr->stack_size + 7) & ~0x7
+    // struct hdr* myhdr = (struct hdr*) app_start;
+    // uint32_t stacktop = mem_start + myhdr->stack_size + myhdr->stack_location
+    "ldr  r4, [r0, " OFF_STACK_SZ "]\n"   // r4 = myhdr->stack_size
+    "ldr  r5, [r0, " OFF_STACK_LOC "]\n"  // r5 = myhdr->stack_location
+    "add  r5, r5, r1\n"
+    "add  r4, r4, r5\n"                   // r4 = stacktop
     //
     // Compute the app data size and where initial app brk should go.
     // This includes the GOT, data, and BSS sections. However, we can't be sure
@@ -97,15 +97,31 @@ void _start(void* app_start __attribute__((unused)),
     // to the end of the BSS section.
     //
     // uint32_t app_brk = mem_start + myhdr->bss_start + myhdr->bss_size;
-    "ldr  r5, [r0, #24]\n"      // r6 = myhdr->bss_start
-    "ldr  r6, [r0, #28]\n"      // r6 = myhdr->bss_size
-    "add  r5, r5, r6\n"         // r5 = bss_start + bss_size
-    "add  r5, r5, r1\n"         // r5 = mem_start + bss_start + bss_size = app_brk
+    "ldr  r5, [r0, " OFF_BSS_START "]\n"      // r5 = myhdr->bss_start
+    "ldr  r6, [r0, " OFF_BSS_SIZE "]\n"      // v3 = myhdr->bss_size
+    "add  r5, r5, r1\n"         // r5 = bss_start + mem_start
+    "add  r5, r5, r6\n"         // r5 = mem_start + bss_start + bss_size = app_brk
     //
     // Move registers we need to keep over to callee-saved locations
     "movs r6, r0\n"             // r6 = app_start
     "movs r7, r1\n"             // r7 = mem_start
-    //
+
+    "mov r1, r5\n"              // r1 = app_brk
+#if CONTIGUOUS
+    // For the contiguous load, we overlap BSS and relocations so they can
+    // be reclaimed. If our relocations are large, we need to move the app
+    // break to be past them
+
+    "ldr  r0, [r6, " OFF_REL_START "]\n"
+    "ldr  r2, [r6, " OFF_REL_SIZE "]\n"
+    "add  r0, r0, r7\n" // r0 = reloc_start
+    "add  r2, r2, r0\n" // r2 = reloc_end
+
+    "cmp   r2, r1 \n"
+    "it    ge     \n"
+    "movge r1, r2\n"      // r1 = reloc_end >= app_brk ? reloc_end : app_brk
+
+#else
     // Now we may want to move the stack pointer. If the kernel set the
     // `app_heap_break` larger than we need (and we are going to call `brk()`
     // to reduce it) then our stack pointer will fit and we can move it now.
@@ -119,12 +135,14 @@ void _start(void* app_start __attribute__((unused)),
     "mov  sp, r4\n"             // Update the stack pointer.
     //
     "skip_set_sp:\n"            // Back to regularly scheduled programming.
+#endif
+
     //
     // Call `brk` to set to requested memory
     //
-    // memop(0, app_brk);
+    // memop(0, max(app_brk, reloc_end));
     "movs r0, #0\n"
-    "movs r1, r5\n"
+    // r1 setup earlier
     "svc 5\n"                   // memop
     //
     // Setup initial stack pointer for normal execution. If we did this before
@@ -145,6 +163,48 @@ void _start(void* app_start __attribute__((unused)),
     "movs r0, #11\n"
     "movs r1, r5\n"
     "svc 5\n"                   // memop
+
+#if CONTIGUOUS
+    // Process relocations. These have all been put in one segment for us and should
+    // be either Elf64_Rel or Elf32_Rel. Don't process these in C, they overlap the stack
+
+    "ldr  r0, [r6, " OFF_REL_START "]\n"
+    "ldr  r1, [r6, " OFF_REL_SIZE "]\n"
+    "add  r0, r0, r7\n" // r0 = reloc_start
+    "add  r1, r1, r0\n" // r1 = reloc_end
+
+    "mov  r2, #0x17\n" // r2 = R_ARM_RELATIVE.
+    "b    loop_footer\n"
+
+    "reloc_loop:\n"
+    "ldr   r3, [r0, %[ARCH_BYTES]]\n"    // r3 = info
+    "ldr   r4, [r0, 0]\n"  // r4 = offset
+
+    "cmp  r3, r2\n"               // check relocation of right type
+    "bne  panic\n"
+
+    "add  r4, r4, r7\n"           // r4 = relocation location
+    "ldr   r3, [r4]\n"             // r3 = addend
+    "add  r3, r3, r7\n"           // r3 = addend + mem_start
+    "str   r3, [r4]\n"             // store new value
+
+    "add  r0, r0, %[RELOC_SZ]\n" // increment reloc_start
+
+    "loop_footer:\n"
+    "cmp  r0, r1 \n"
+    "bne  reloc_loop\n"
+
+    // And if the break was set too high (e.g. reloc_end > app_brk),
+    // move it back
+    "cmp r1, r5\n"
+    "ble skip_second_brk\n"
+    // memop(0, app_brk);
+    "mov r0, #0\n"
+    "mov r1, r5\n"
+    "svc 5\n"                   // memop
+    "skip_second_brk:\n"
+
+#else // !CONTIGUOUS
     //
     // Set the special PIC register r9. This has to be set to the address of the
     // beginning of the GOT section. The PIC code uses this as a reference point
@@ -152,29 +212,46 @@ void _start(void* app_start __attribute__((unused)),
     "ldr  r0, [r6, #4]\n"       // r0 = myhdr->got_start
     "add  r0, r0, r7\n"         // r0 = myhdr->got_start + mem_start
     "mov  r9, r0\n"             // r9 = r0
+#endif
     //
     // Call into the rest of startup.
     // This should never return, if it does, trigger a breakpoint (which will
     // promote to a HardFault in the absence of a debugger)
     "movs r0, r6\n"             // first arg is app_start
     "movs r1, r7\n"             // second arg is mem_start
+#if !CONTIGUOUS
     "bl _c_start_pic\n"
+#else
+    "bl _c_start_noflash\n"
+#endif
+    "panic: \n"
     "bkpt #255\n"
+    :
+    : [ARCH_BYTES] "n" (sizeof(size_t)),
+    [RELOC_SZ] "n" (sizeof(size_t) * 2)
     );
 
 #elif defined(__riscv)
+
+#ifdef __CHERI_PURE_CAPABILITY__
+#define PRFX "c"
+#define ZREG "cnull"
+#else
+#define PRFX ""
+#define ZREG "zero"
+#endif
 
   __asm__ volatile (
     // Compute the stack top.
     //
     // struct hdr* myhdr = (struct hdr*) app_start;
-    // uint32_t stacktop = (((uint32_t) mem_start + myhdr->stack_size + 7) & 0xfffffff8);
-    "lw   t0, 36(a0)\n"         // t0 = myhdr->stack_size
-    "addi t0, t0, 7\n"          // t0 = myhdr->stack_size + 7
-    "add  t0, t0, a1\n"         // t0 = mem_start + myhdr->stack_size + 7
-    "li   t1, 7\n"              // t1 = 7
-    "not  t1, t1\n"             // t1 = ~0x7
-    "and  t0, t0, t1\n"         // t0 = (mem_start + myhdr->stack_size + 7) & ~0x7
+    // uint32_t stacktop = mem_start + myhdr->stack_size + myhdr->stack_location
+
+    PRFX "lw   t0, " OFF_STACK_SZ "("PRFX "a0)\n"         // t0 = myhdr->stack_size
+    PRFX "lw   t1, " OFF_STACK_LOC "("PRFX "a0)\n"         // t1 = myhdr->stack_location
+    "add  t0, t0, a1\n"
+    "add  t0, t0, t1\n"
+
     //
     // Compute the app data size and where initial app brk should go.
     // This includes the GOT, data, and BSS sections. However, we can't be sure
@@ -184,8 +261,8 @@ void _start(void* app_start __attribute__((unused)),
     // to the end of the BSS section.
     //
     // uint32_t app_brk = mem_start + myhdr->bss_start + myhdr->bss_size;
-    "lw   t1, 24(a0)\n"         // t1 = myhdr->bss_start
-    "lw   t2, 28(a0)\n"         // t2 = myhdr->bss_size
+    PRFX "lw   t1, " OFF_BSS_START "("PRFX "a0)\n"         // t1 = myhdr->bss_start
+    PRFX "lw   t2, " OFF_BSS_SIZE "("PRFX "a0)\n"         // t2 = myhdr->bss_size
     "add  t1, t1, t2\n"         // t1 = bss_start + bss_size
     "add  t1, t1, a1\n"         // t1 = mem_start + bss_start + bss_size = app_brk
     //
@@ -193,6 +270,27 @@ void _start(void* app_start __attribute__((unused)),
     "mv   s0, a0\n"             // s0 = void* app_start
     "mv   s1, t0\n"             // s1 = stack_top
     "mv   s2, a1\n"             // s2 = mem_start
+
+    //
+    // Setup initial stack pointer for normal execution
+    "mv   sp, s1\n"             // sp = stacktop
+
+    // We have overlapped the our BSS/HEAP with our relocations. If our
+    // relocations are larger, then we need to move the break to include
+    // relocations. Once we have processed relocations, we will move them
+    // back.
+
+    PRFX "lw  a0, " OFF_REL_START "("PRFX "s0)\n"
+    PRFX "lw  a1, " OFF_REL_SIZE "(" PRFX "s0)\n"
+    "add a0, a0, s2          // a0 = reloc_start\n"
+    "add s3, a0, a1          // a1 = reloc_end\n"
+
+    "bgt  s3, t1, relocs_larger_than_bss\n"
+    "mv   s3, t1\n"
+    "relocs_larger_than_bss:\n"
+
+    // s3 is now the larger of the two
+
     //
     // Now we may want to move the stack pointer. If the kernel set the
     // `app_heap_break` larger than we need (and we are going to call `brk()`
@@ -200,24 +298,20 @@ void _start(void* app_start __attribute__((unused)),
     // Otherwise after the first syscall (the memop to set the brk), the return
     // will use a stack that is outside of the process accessible memory.
     //
-    "bgt t1, a3, skip_set_sp\n" // Compare `app_heap_break` with new brk.
-                                // If our current `app_heap_break` is larger
-                                // then we need to move the stack pointer
-                                // before we call the `brk` syscall.
-    "mv  sp, t0\n"              // Update the stack pointer
-
-    "skip_set_sp:\n"            // Back to regularly scheduled programming.
+    "ble s3, a3, skip_brk\n"    // Compare `app_heap_break` with new brk.
+                                // Skip setting if we don't need
 
     // Call `brk` to set to requested memory
-    // memop(0, stacktop + appdata_size);
+    // memop(0, max(end_of_bss,end_of_relocs));
     "li  a4, 5\n"               // a4 = 5   // memop syscall
     "li  a0, 0\n"               // a0 = 0
-    "mv  a1, t1\n"              // a1 = app_brk
+    "mv  a1, s3\n"              // a1 = app_brk
     "ecall\n"                   // memop
-
-    //
-    // Setup initial stack pointer for normal execution
-    "mv   sp, s1\n"             // sp = stacktop
+#if __has_feature(capabilities)
+    // On CHERI, brk returns a capability to authorise the new break
+    "cspecialw ddc, ca1\n"
+#endif
+    "skip_brk:\n"
 
     //
     // Debug support, tell the kernel the stack location
@@ -236,17 +330,115 @@ void _start(void* app_start __attribute__((unused)),
     "mv  a1, t1\n"              // a1 = app_brk
     "ecall\n"                   // memop
 
+    // Process relocations. These have all been put in one segment for us and should
+    // be either Elf64_Rel or Elf32_Rel. Don't process these in C, they overlap the stack
+
+    ".set ARCH_BYTES, %[ARCH_BYTES]\n"
+
+    /* Store word on 32-bit, or double word on 64-bit */
+    ".macro sx val, offset, base\n"
+    ".if ARCH_BYTES == 4\n"
+    PRFX "sw \\val, \\offset("PRFX "\\base)\n"
+    ".else\n"
+    PRFX "sd \\val, \\offset("PRFX "\\base)\n"
+    ".endif\n"
+    ".endmacro\n"
+
+    /* Load word on 32-bit, or double word on 64-bit */
+    ".macro lx val, offset, base\n"
+    ".if ARCH_BYTES == 4\n"
+    PRFX "lw \\val, \\offset("PRFX "\\base)\n"
+    ".else\n"
+    PRFX "ld \\val, \\offset("PRFX "\\base)\n"
+    ".endif\n"
+    ".endmacro\n"
+
+    ".set r_offset, 0\n"
+    ".set r_info, ARCH_BYTES\n"
+    ".set ent_size, (ARCH_BYTES*2)\n"
+
+    PRFX "lw  a0, " OFF_REL_START "("PRFX "s0)\n"
+    PRFX "lw  a1, " OFF_REL_SIZE "(" PRFX "s0)\n"
+    "add a0, a0, s2          // a0 = reloc_start\n"
+    "add a1, a0, a1          // a1 = reloc_end\n"
+
+    "li  t0, 3               // t0 = R_RISCV_RELATIVE. The only relocation\n"
+    "// we should see.\n"
+    "beq a0, a1, skip_loop\n"
+    "reloc_loop:\n"
+    // Relocations are relative to a symbol, the table for which we have stripped.
+    // However, all the remaining relocations should use the special "0" symbol,
+    // and encode the values required in the addend.
+    "lx  a2, r_info, a0   // a2 = info\n"
+    "lx  a3, r_offset, a0 // a3 = offset\n"
+    "bne a2, t0, panic   // Only processing this relocation.\n"
+    "add a3, a3, s2      // a3 = offset + reloc_offset\n"
+    "lx   a4, 0, a3       // a4 = addend\n"
+    "add a4, a4, s2      // a4 = addend + reloc_offset\n"
+    "// Store new value\n"
+    "sx  a4, 0, a3\n"
+    "skip_relocate:\n"
+    "add a0, a0, ent_size\n"
+    "loop_footer:\n"
+    "bne a0, a1, reloc_loop\n"
+    "skip_loop:\n"
+
+    // Now relocations have been processed. If we moved our break too much, move it back.
+    // t1 still has the end of bss. a1 has the end of the relocs.
+    "bgt t1, a1, skip_second_brk\n"
+    "li  a4, 5\n"               // a4 = 5   // memop syscall
+    "li  a0, 0\n"               // a0 = 0
+    "mv  a1, t1\n"              // a1 = app_brk
+    "ecall\n"                   // memop
+    "skip_second_brk:\n"
+
     // Call into the rest of startup. This should never return.
     "mv   a0, s0\n"             // first arg is app_start
     "mv   s0, sp\n"             // Set the frame pointer to sp.
     "mv   a1, s2\n"             // second arg is mem_start
-    "jal  _c_start_nopic\n"
+
+#ifdef __CHERI_PURE_CAPABILITY__
+    // By convention we are starting in non-cap mode and this startup code was run with integers. Change into cap mode:
+    // auipcc is actually auipc because we are not in cap mode
+    "1: auipcc      ct0, %%pcrel_hi(cap_mode_tramp) \n"
+    "cincoffset     ct0, ct0, %%pcrel_lo(1b)        \n"
+    "cspecialr      ct1, pcc                        \n"
+    "csetaddr       ct1, ct1, t0                    \n"
+    "li             t0,  1                          \n"
+    "csetflags      ct1, ct1, t0                    \n"
+    "jr.cap         ct1                             \n"
+    "cap_mode_tramp:                                \n"
+    // Now we are in cap-mode instructions will have the encoding we expect
+    // Rederive app_start/mem_start/sp from ddc
+    "cspecialr      ct0, ddc     \n"
+    "csetaddr       ca0, ct0, a0 \n"   // app_start
+    "csetaddr       ca1, ct0, a1 \n"   // mem_start
+    "csetaddr       csp, ct0, sp \n"   // sp
+    // Also bounds SP:
+    "clw            t0, " OFF_STACK_SZ "(ca0)  \n"
+    "neg            t1, t0\n"
+    "cincoffset     csp, csp, t1 \n"
+    "csetbounds     csp, csp, t0 \n"
+    "cincoffset     csp, csp, t0 \n"
+#endif
+
+    // Call into the rest of startup. This should never return.
+    PRFX "jal  _c_start_noflash         \n"
+
+    "panic:\n"
+    PRFX "lw        t0, 0(" ZREG ")\n"
+    :
+    : [align] "n" (sizeof(void*) - 1),
+    [ARCH_BYTES] "n" (sizeof(size_t))
     );
 
 #else
 #error Missing initial stack setup trampoline for current arch.
 #endif
 }
+
+
+#if !CONTIGUOUS
 
 // C startup routine that configures memory for the process. This also handles
 // PIC fixups that are required for the application.
@@ -333,17 +525,21 @@ void _c_start_pic(uint32_t app_start, uint32_t mem_start) {
   }
 }
 
+#endif
+
 // C startup routine for apps compiled with fixed addresses (i.e. no PIC).
 //
 // Arguments:
 // - `app_start`: The address of where the app binary starts in flash. This does
 //   not include the TBF header or any padding before the app.
+//   on CHERI hybrid, app_start may not be covered by DDC so is an explicit cap.
 // - `mem_start`: The starting address of the memory region assigned to this
 //   app.
 __attribute__((noreturn))
-void _c_start_nopic(uint32_t app_start, uint32_t mem_start) {
+void _c_start_noflash(uintptr_t app_start, uintptr_t mem_start) {
   struct hdr* myhdr = (struct hdr*)app_start;
 
+#if !CONTIGUOUS
   // Copy over the Global Offset Table (GOT). The GOT seems to still get created
   // and used in some cases, even though nothing is being relocated and the
   // addresses are static. So, all we need to do is copy the GOT entries from
@@ -358,11 +554,18 @@ void _c_start_nopic(uint32_t app_start, uint32_t mem_start) {
   void* data_start     = (void*)(myhdr->data_start + mem_start);
   void* data_sym_start = (void*)(myhdr->data_sym_start + app_start);
   memcpy(data_start, data_sym_start, myhdr->data_size);
+#endif
 
-  // Zero BSS segment. Again, we know where this should be in the process RAM
-  // based on the crt0 header.
+  // We always do the clear because we may have used BSS for init
   char* bss_start = (char*)(myhdr->bss_start + mem_start);
   memset(bss_start, 0, myhdr->bss_size);
+
+#ifdef __CHERI_PURE_CAPABILITY__
+  cheri_init_globals();
+  // We no longer need the default capability:
+  __asm(" cmove          ct0, cnull \n"
+        " cspecialw      ddc, ct0   \n" ::: "ct0");
+#endif
 
   main();
   while (1) {
